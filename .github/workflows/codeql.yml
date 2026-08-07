@@ -2,24 +2,8 @@ name: "CodeQL Advanced"
 
 on:
   push:
-    branches: ["main"]
-    # CodeQL 仅分析 Actions 与 Python；配置、规则和 Wiki 变更无需扫描。
-    paths:
-      - ".github/workflows/**"
-      - ".github/scripts/**"
-      - ".github/dependabot.yml"
-      - "py/**"
-      - "requirements*.txt"
   pull_request:
-    branches: ["main"]
-    paths:
-      - ".github/workflows/**"
-      - ".github/scripts/**"
-      - ".github/dependabot.yml"
-      - "py/**"
-      - "requirements*.txt"
   schedule:
-    # 每日执行一次完整扫描，以尽快获得最新 CodeQL 查询结果。
     - cron: "17 2 * * *"
   workflow_dispatch:
 
@@ -35,9 +19,13 @@ concurrency:
 
 jobs:
   analyze:
+    if: |
+      (github.event_name == 'push' && github.ref_name == ((vars.WORK_BRANCH != '' && vars.WORK_BRANCH) || 'main')) ||
+      (github.event_name == 'pull_request' && github.base_ref == ((vars.WORK_BRANCH != '' && vars.WORK_BRANCH) || 'main')) ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
     name: Analyze (${{ matrix.language }})
     runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
-    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -48,19 +36,19 @@ jobs:
             build-mode: none
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v6
         with:
+          ref: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && ((vars.WORK_BRANCH != '' && vars.WORK_BRANCH) || 'main') || github.ref }}
           fetch-depth: 2
-          persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           queries: security-extended,security-and-quality
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
