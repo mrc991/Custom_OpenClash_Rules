@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import jsdelivr_purge as purge
@@ -21,9 +22,8 @@ def contract() -> purge.PublishContract:
         repository=REPOSITORY,
         branch="main",
         ref_aliases=("main", "refs/heads/main"),
-        verify_hosts=("cdn.jsdelivr.net", "testingcf.jsdelivr.net"),
         public_roots=frozenset(
-            {"cfg", "game_rule", "icon", "overwrite", "rule", "script", "shell"}
+            {"cfg", "icon", "overwrite", "rule", "script", "shell"}
         ),
         deferred_sources=frozenset(
             {
@@ -32,6 +32,13 @@ def contract() -> purge.PublishContract:
                 "rule/Steam_CDN.list",
                 "rule/Encrypted_DNS.list",
                 "rule/Game_Download_CDN.list",
+            }
+        ),
+        snapshot_deferred_inputs=frozenset(
+            {
+                "py/generate_rules.py",
+                "py/generate_stash_configs.py",
+                "cfg/Custom_Clash.ini",
             }
         ),
         generated_suffixes=(
@@ -78,8 +85,9 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(purge.is_public_path("rule/static.yaml", value))
         self.assertTrue(purge.is_public_path("icon/match.png", value))
         self.assertFalse(purge.is_public_path("py/generate_rules.py", value))
+        self.assertFalse(purge.is_public_path("game_rule/legacy.list", value))
         self.assertFalse(purge.is_public_path("rule/archived/old.yaml", value))
-        self.assertFalse(purge.is_public_path("game_rule/README.md", value))
+        self.assertFalse(purge.is_public_path("rule/game_rule/README.md", value))
         self.assertFalse(
             purge.is_public_path("overwrite/OpenClash_Overwrite", value)
         )
@@ -134,20 +142,40 @@ class ContractTests(unittest.TestCase):
         finally:
             sys.modules.pop(spec.name, None)
 
-        expected_sources = {
-            f"rule/{base_name}.list" for base_name in module.BASE_NAMES
-        }
+        expected_sources = {path.as_posix() for path in module.source_paths(root)}
         self.assertEqual(value.deferred_sources, expected_sources)
 
         outputs, mrs_inputs = module.textual_outputs(root)
         generated_suffixes = set()
         for path in (*outputs, *mrs_inputs):
-            for base_name in module.BASE_NAMES:
-                prefix = f"{base_name}_"
-                if path.name.startswith(prefix):
+            for source in module.source_paths(root):
+                prefix = f"{source.stem}_"
+                if path.parent == source.parent and path.name.startswith(prefix):
                     generated_suffixes.add(path.name[len(prefix) :])
                     break
         self.assertEqual(set(value.generated_suffixes), generated_suffixes)
+
+        stash_module_path = root / "py/generate_stash_configs.py"
+        stash_spec = importlib.util.spec_from_file_location(
+            "stash_generator_contract", stash_module_path
+        )
+        self.assertIsNotNone(stash_spec)
+        self.assertIsNotNone(stash_spec.loader)
+        stash_module = importlib.util.module_from_spec(stash_spec)
+        sys.modules[stash_spec.name] = stash_module
+        try:
+            stash_spec.loader.exec_module(stash_module)
+        finally:
+            sys.modules.pop(stash_spec.name, None)
+
+        expected_snapshot_inputs = {
+            "py/generate_rules.py",
+            "py/generate_stash_configs.py",
+            *(f"cfg/{source}" for source, _target in stash_module.TEMPLATE_PAIRS),
+        }
+        self.assertEqual(
+            value.snapshot_deferred_inputs, expected_snapshot_inputs
+        )
 
 
 class GitPlanningTests(unittest.TestCase):
@@ -241,6 +269,74 @@ class GitPlanningTests(unittest.TestCase):
                 with self.assertRaisesRegex(purge.PublishError, "not an ancestor"):
                     purge.resolve_range(first, second)
 
+    def test_worker_snapshot_waits_for_generated_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            git("init", "-b", "main", cwd=repo)
+            git("config", "user.name", "Test", cwd=repo)
+            git("config", "user.email", "test@example.com", cwd=repo)
+            (repo / "rule").mkdir()
+            (repo / "rule/Custom_Proxy.list").write_text("old\n", encoding="utf-8")
+            git("add", ".", cwd=repo)
+            git("commit", "-m", "initial", cwd=repo)
+            before = git("rev-parse", "HEAD", cwd=repo)
+
+            (repo / "rule/Custom_Proxy.list").write_text("new\n", encoding="utf-8")
+            git("add", ".", cwd=repo)
+            git("commit", "-m", "source", cwd=repo)
+            after = git("rev-parse", "HEAD", cwd=repo)
+
+            with working_directory(repo):
+                deployable, blocked = purge.plan_worker_snapshot(
+                    before, after, contract(), generation_complete=False
+                )
+                complete, complete_blocked = purge.plan_worker_snapshot(
+                    before, after, contract(), generation_complete=True
+                )
+            self.assertFalse(deployable)
+            self.assertEqual(blocked, ("rule/Custom_Proxy.list",))
+            self.assertTrue(complete)
+            self.assertEqual(complete_blocked, blocked)
+
+    def test_worker_assets_are_built_from_exact_public_git_blobs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            output = Path(temp_dir) / "assets"
+            repo.mkdir()
+            git("init", "-b", "main", cwd=repo)
+            git("config", "user.name", "Test", cwd=repo)
+            git("config", "user.email", "test@example.com", cwd=repo)
+            for directory in ("cfg", "rule", "py", "rule/archived"):
+                (repo / directory).mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("project\n", encoding="utf-8")
+            (repo / "LICENCE").write_text("license\n", encoding="utf-8")
+            (repo / "cfg/example.ini").write_bytes(b"config\n")
+            (repo / "rule/Custom_Direct.list").write_bytes(b"canary\n")
+            (repo / "rule/README.md").write_text("excluded\n", encoding="utf-8")
+            (repo / "rule/archived/old.list").write_text("old\n", encoding="utf-8")
+            (repo / "py/private.py").write_text("private\n", encoding="utf-8")
+            git("add", ".", cwd=repo)
+            git("commit", "-m", "snapshot", cwd=repo)
+            revision = git("rev-parse", "HEAD", cwd=repo)
+
+            with working_directory(repo):
+                manifest = purge.write_worker_snapshot(
+                    revision, output, contract()
+                )
+
+            prefix = output / "Custom_OpenClash_Rules" / "main"
+            self.assertEqual((prefix / "cfg/example.ini").read_bytes(), b"config\n")
+            self.assertEqual((prefix / "README.md").read_text(), "project\n")
+            self.assertFalse((prefix / "rule/README.md").exists())
+            self.assertFalse((prefix / "rule/archived/old.list").exists())
+            self.assertFalse((prefix / "py/private.py").exists())
+            self.assertEqual(manifest["commit"], revision)
+            self.assertEqual(manifest["file_count"], 4)
+            self.assertEqual(
+                manifest["canary"]["sha256"],
+                purge.hashlib.sha256(b"canary\n").hexdigest(),
+            )
+
 
 class PurgeResponseTests(unittest.TestCase):
     def response(self, path: str, *, throttled=False, providers=None):
@@ -254,17 +350,18 @@ class PurgeResponseTests(unittest.TestCase):
         }
         return purge.HttpResult(200, json.dumps(body).encode())
 
-    def test_requires_exact_path_and_all_providers(self):
+    def test_finished_status_is_sufficient(self):
         path = "/gh/Aethersailor/Custom_OpenClash_Rules@main/cfg/a.ini"
         purge.validate_purge_response(self.response(path), path)
-        with self.assertRaisesRegex(purge.PublishError, "omitted exact path"):
-            purge.validate_purge_response(self.response(path + ".other"), path)
-        with self.assertRaisesRegex(purge.PublishError, "providers failed"):
-            purge.validate_purge_response(
-                self.response(path, providers={"CF": True, "FY": False}), path
-            )
-        with self.assertRaisesRegex(purge.PublishError, "throttled"):
-            purge.validate_purge_response(self.response(path, throttled=True), path)
+        purge.validate_purge_response(self.response(path + ".other"), path)
+        purge.validate_purge_response(
+            self.response(path, providers={"CF": True, "FY": False}), path
+        )
+        purge.validate_purge_response(self.response(path, throttled=True), path)
+
+        unfinished = purge.HttpResult(200, json.dumps({"status": "processing"}).encode())
+        with self.assertRaisesRegex(purge.PublishError, "did not finish"):
+            purge.validate_purge_response(unfinished, path)
 
     def test_retry_then_success(self):
         calls: list[str] = []
@@ -289,33 +386,29 @@ class PurgeResponseTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(sleeps, [2])
 
+    def test_purge_all_requests_every_alias_and_path(self):
+        value = contract()
+        expectations = [
+            purge.AssetExpectation("cfg/a.ini", b"one"),
+            purge.AssetExpectation("rule/b.yaml", b"two"),
+        ]
+        calls: list[tuple[str, str, str]] = []
 
-class VerificationTests(unittest.TestCase):
-    def test_content_and_deletion_expectations(self):
-        content = purge.AssetExpectation("cfg/a.ini", b"expected")
-        deleted = purge.AssetExpectation("cfg/deleted.ini", None)
-        self.assertTrue(purge.result_matches(purge.HttpResult(200, b"expected"), content)[0])
-        self.assertFalse(purge.result_matches(purge.HttpResult(200, b"stale"), content)[0])
-        self.assertTrue(purge.result_matches(purge.HttpResult(404, b""), deleted)[0])
-        self.assertFalse(purge.result_matches(purge.HttpResult(200, b"old"), deleted)[0])
+        def record(repository: str, alias: str, path: str) -> str:
+            calls.append((repository, alias, path))
+            return f"https://purge.jsdelivr.net/{alias}/{path}"
 
-    def test_verification_retries_only_stale_targets(self):
-        target = purge.VerificationTarget(
-            "https://cdn.jsdelivr.net/example", purge.AssetExpectation("cfg/a", b"new")
+        with unittest.mock.patch.object(purge, "purge_target", side_effect=record):
+            purge.purge_all(expectations, value, workers=1)
+
+        self.assertEqual(
+            set(calls),
+            {
+                (REPOSITORY, alias, expectation.path)
+                for alias in value.ref_aliases
+                for expectation in expectations
+            },
         )
-        calls = 0
-        sleeps: list[float] = []
-
-        def requester(_url: str) -> purge.HttpResult:
-            nonlocal calls
-            calls += 1
-            return purge.HttpResult(200, b"old" if calls == 1 else b"new")
-
-        purge.verify_all(
-            [target], requester=requester, attempts=2, workers=1, sleeper=sleeps.append
-        )
-        self.assertEqual(calls, 2)
-        self.assertEqual(sleeps, [2])
 
 
 class UrlContractTests(unittest.TestCase):
