@@ -1,7 +1,7 @@
 # Generated from rule/Custom_Proxy.list
 # REPO: https://github.com/mrc991/Custom_OpenClash_Rules
 # SOURCE: https://github.com/mrc991/Custom_OpenClash_Rules/blob/main/rule/Custom_Proxy.list
-# TOTAL: 17
+# TOTAL: 19
 
 payload:
   - '+.7pzzv.us'
@@ -15,6 +15,8 @@ payload:
   - '+.hoyoverse.com'
   - '+.ip.sb'
   - '+.ipify.org'
+  - '+.jsdelivr.com'
+  - '+.jsdelivr.net'
   - '+.mtalk.google.com'
   - '+.onedrive.live.com'
   - '+.platformio.org'
