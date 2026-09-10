@@ -3,6 +3,10 @@
 # REPO: https://github.com/Aethersailor/Custom_OpenClash_Rules
 # 强制代理列表，来自个人收集
 
+# jsDelivr：cdn.jsdelivr.net 国内直连常被 RST，须走代理
+DOMAIN-SUFFIX,jsdelivr.com
+DOMAIN-SUFFIX,jsdelivr.net
+
 # OpenClash 首页 IP 地址探测
 DOMAIN-SUFFIX,ip.sb
 DOMAIN-SUFFIX,ipify.org
